@@ -1,0 +1,1431 @@
+import React, { useState, useMemo, useCallback, useEffect } from "react";
+import {
+  ResponsiveContainer, ComposedChart, Line, XAxis, YAxis,
+  CartesianGrid, Tooltip, Legend, ReferenceLine,
+} from "recharts";
+
+/* =========================================================================
+   AI 수요예측 재고관리 대시보드 — "소상공인 AI 재고관리 대시보드"
+   - 6개월치 가상 판매 데이터(Mock) + LLM(웹 검색) 기반 발주량 조정 제안
+   - 단일 파일 React 프로토타입 (Recharts / Tailwind 유틸리티)
+   ========================================================================= */
+
+/* ---------------------------- 1. Mock 데이터 ---------------------------- */
+
+// 26주(약 6개월) 주간 판매량 생성 — 결정적(deterministic) 노이즈 사용
+const NOISE = [3, -2, 5, -4, 1, 6, -3, 2, -5, 4, 0, -1, 7, -6, 2, 3, -2, -4, 5, 1, -3, 6, -1, 2, -5, 4];
+const genSeries = (base, trend, amp, phase, nScale) =>
+  Array.from({ length: 26 }, (_, i) =>
+    Math.max(2, Math.round(base + trend * i + amp * Math.sin((i / 26) * Math.PI * 2 + phase) + NOISE[i] * nScale))
+  );
+
+// 주차 시작일: 2026-01-05(월) 기준. 현재 시점: 2026-07-09
+const weekLabel = (i) => {
+  const d = new Date(2026, 0, 5 + i * 7);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+};
+
+// 계절 시뮬레이터 탭 — 실제 오늘 날짜와 별개로, 사용자가 선택한 계절 기준으로
+// 어떤 상품이 성수기(안전재고 증가 대상)인지 미리 확인해볼 수 있습니다.
+const SEASONS = [
+  { key: "spring", label: "봄", icon: "🌱", months: [3, 4, 5] },
+  { key: "summer", label: "여름", icon: "☀️", months: [6, 7, 8] },
+  { key: "fall", label: "가을", icon: "🍂", months: [9, 10, 11] },
+  { key: "winter", label: "겨울", icon: "❄️", months: [12, 1, 2] },
+];
+const seasonKeyForMonth = (month) => SEASONS.find((s) => s.months.includes(month))?.key || "summer";
+
+const TODAY = new Date(2026, 6, 9); // 대시보드 기준일 (2026-07-09)
+
+const PRODUCTS = [
+
+
+  { id: "p1", name: "프리미엄 린넨 셔츠", sku: "TOP-LN-001", inventory: 320, unitCost: 18500, price: 49000, leadTime: 14, keyword: "폭염 여름 의류 트렌드", peakMonths: [6, 7, 8], sales: genSeries(38, 2.3, 8, -1.2, 1.2) },
+  { id: "p2", name: "쿨텍 반팔 티셔츠", sku: "TOP-CT-014", inventory: 540, unitCost: 7200, price: 19900, leadTime: 10, keyword: "여름 무더위 냉감 의류", peakMonths: [6, 7, 8], sales: genSeries(52, 3.1, 10, -1.0, 1.5) },
+  { id: "p3", name: "오버핏 덕다운 패딩", sku: "OUT-PD-007", inventory: 180, unitCost: 62000, price: 159000, leadTime: 35, keyword: "겨울 한파 전망 패딩", peakMonths: [11, 12, 1, 2], sales: genSeries(92, -3.3, 12, 1.4, 1.0) },
+  { id: "p4", name: "와이드 데님 팬츠", sku: "BTM-DN-021", inventory: 410, unitCost: 15800, price: 42000, leadTime: 18, keyword: "데님 패션 트렌드", peakMonths: null, sales: genSeries(68, 0.1, 6, 0.5, 1.4) }, // null = 연중 스테디셀러(평시 고정)
+  { id: "p5", name: "울블렌드 니트 가디건", sku: "TOP-KN-009", inventory: 95, unitCost: 21000, price: 55000, leadTime: 21, keyword: "간절기 니트 수요", peakMonths: [9, 10, 11], sales: genSeries(58, -1.4, 9, 1.1, 1.1) },
+];
+
+/* ------------------------- 1-0b. 계절별 재고 기준 ------------------------- */
+// 소상공인 규모 가정(아래 회사 정보 카드 참고)에 맞춰, 성수기/비수기에 따라
+// 안전재고 비율과 재고 유지비율을 다르게 적용합니다.
+//   - 성수기: 품절 리스크가 크므로 안전재고↑, 회전이 빨라 유지비율↓
+//   - 비수기: 수요가 낮아 안전재고↓, 재고가 오래 묶여 유지비율↑
+//   - 평시(연중 스테디셀러): 중간값 고정
+const SEASON_RATES = {
+  peak: { label: "성수기", safetyStock: 0.20, holding: 0.015, demandMultiplier: 1.35 },
+  off: { label: "비수기", safetyStock: 0.10, holding: 0.025, demandMultiplier: 0.70 },
+  neutral: { label: "평시", safetyStock: 0.15, holding: 0.02, demandMultiplier: 1.00 },
+};
+
+const getSeasonInfo = (product, today) => {
+  if (!product.peakMonths) return { key: "neutral", ...SEASON_RATES.neutral };
+  const month = today.getMonth() + 1;
+  const key = product.peakMonths.includes(month) ? "peak" : "off";
+  return { key, ...SEASON_RATES[key] };
+};
+
+/* -------------------------- 1-1. 상품 아이콘(SVG) -------------------------- */
+// 카테고리별 심플 라인 아이콘 — currentColor로 테마에 맞춰 색상 자동 적용
+const PRODUCT_ICONS = {
+  p1: (props) => ( // 린넨 셔츠
+    <svg viewBox="0 0 48 48" fill="none" {...props}>
+      <path d="M18 6l6 4 6-4 8 6-4 6-4-2v24H12V16l-4 2-4-6 8-6z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+      <path d="M24 10v6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  ),
+  p2: (props) => ( // 반팔 티셔츠
+    <svg viewBox="0 0 48 48" fill="none" {...props}>
+      <path d="M17 7l7 3 7-3 8 5-3 7-5-2v22H15V17l-5 2-3-7 8-5z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+    </svg>
+  ),
+  p3: (props) => ( // 덕다운 패딩
+    <svg viewBox="0 0 48 48" fill="none" {...props}>
+      <path d="M17 6l7 3 7-3 8 6-4 7-4-2v3l3 2-2 4 2 4-2 4 2 5H14l2-5-2-4 2-4-2-4 3-2v-3l-4 2-4-7 8-6z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+      <path d="M24 16v22" stroke="currentColor" strokeWidth="1.6" strokeDasharray="1 4" strokeLinecap="round" />
+    </svg>
+  ),
+  p4: (props) => ( // 와이드 데님 팬츠
+    <svg viewBox="0 0 48 48" fill="none" {...props}>
+      <path d="M15 6h18l1 15 2 18h-9l-3-19-3 19h-9l2-18 1-15z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+      <path d="M15 12h18" stroke="currentColor" strokeWidth="1.6" />
+    </svg>
+  ),
+  p5: (props) => ( // 니트 가디건
+    <svg viewBox="0 0 48 48" fill="none" {...props}>
+      <path d="M16 6l8 3 8-3 7 6-3 6-4-2v22H16V16l-4 2-3-6 7-6z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+      <path d="M24 9v31" stroke="currentColor" strokeWidth="1.6" strokeDasharray="1 3.5" strokeLinecap="round" />
+      <circle cx="21.5" cy="16" r="0.9" fill="currentColor" />
+      <circle cx="21.5" cy="24" r="0.9" fill="currentColor" />
+      <circle cx="21.5" cy="32" r="0.9" fill="currentColor" />
+    </svg>
+  ),
+};
+
+
+
+// 기존(베이스라인) 4주 예측: 최근 4주 평균 + 최근 8주 선형 추세 외삽
+const baselineForecast = (sales) => {
+  const recent = sales.slice(-8);
+  const avg4 = sales.slice(-4).reduce((a, b) => a + b, 0) / 4;
+  const slope = (recent[7] - recent[0]) / 7;
+  return Array.from({ length: 4 }, (_, i) => Math.max(0, Math.round(avg4 + slope * (i + 1))));
+};
+
+// 계절 시뮬레이터가 반영된 4주 예측: 통계 기반 베이스라인에 계절 수요 배율을 곱함
+// (성수기 ×1.35, 비수기 ×0.70, 평시 ×1.00) — 안전재고·유지비용뿐 아니라
+// 그래프의 수요 예측선 자체가 계절에 따라 오르내리도록 하기 위함
+const seasonalForecast = (product, referenceDate) => {
+  const season = getSeasonInfo(product, referenceDate);
+  const raw = baselineForecast(product.sales);
+  return raw.map((v) => Math.max(0, Math.round(v * season.demandMultiplier)));
+};
+
+const fmt = (n) => n.toLocaleString("ko-KR");
+const fmtWon = (n) => `₩${Math.round(n).toLocaleString("ko-KR")}`;
+const fmtWonSigned = (n) => `${n >= 0 ? "+" : "−"}₩${Math.abs(Math.round(n)).toLocaleString("ko-KR")}`;
+const hexToRgba = (hex, a) => {
+  const h = hex.replace("#", "");
+  const r = parseInt(h.substring(0, 2), 16), g = parseInt(h.substring(2, 4), 16), b = parseInt(h.substring(4, 6), 16);
+  return `rgba(${r},${g},${b},${a})`;
+};
+
+// 백테스트: 마지막 4주를 숨기고 동일 방식으로 예측한 뒤 실제값과 비교 → MAPE(평균 절대 오차율)
+const backtest = (sales) => {
+  const train = sales.slice(0, -4);      // 1~22주차로 학습
+  const actual = sales.slice(-4);        // 23~26주차 실제값
+  const pred = baselineForecast(train);
+  const rows = pred.map((p, i) => {
+    const signedErr = ((p - actual[i]) / Math.max(1, actual[i])) * 100; // 양수: 과대예측, 음수: 과소예측
+    return {
+      week: weekLabel(22 + i),
+      pred: p,
+      actual: actual[i],
+      err: Math.abs(signedErr),
+      signedErr,
+    };
+  });
+  const mape = rows.reduce((a, r) => a + r.err, 0) / rows.length;
+  return { rows, mape };
+};
+
+// 재무 임팩트 환산: 수요 변화량(개) → 매출/리스크 금액(₩)
+const financialImpact = (product, baseSum, adjSum, season) => {
+  const delta = adjSum - baseSum;                       // 4주 수요 변화량
+  const revenue = delta * product.price;                // 예상 매출 영향
+  const margin = product.price - product.unitCost;
+  const holdingRate = season ? season.holding : 0.02;
+  // 미반영 시 리스크: 상향 제안 무시 → 품절 기회손실(마진 상실)
+  //                  하향 제안 무시 → 과잉재고 손실(계절별 월 유지비 + 시즌오프 처분손실 10% 가정)
+  const risk = delta > 0
+    ? delta * margin
+    : Math.abs(delta) * product.unitCost * (holdingRate + 0.10);
+  return { delta, revenue, risk };
+};
+
+/* ----------------------------- 3. 테마 토큰 ----------------------------- */
+
+const THEMES = {
+  light: {
+    bg: "#F4F6F8", surface: "#FFFFFF", surfaceAlt: "#EDF1F5", border: "#DEE5EC",
+    ink: "#13253B", sub: "#5B6B7E", faint: "#8A99AB",
+    brand: "#0E7490", brandSoft: "#E0F2F7",
+    amber: "#B45309", amberBg: "#FEF3E2",
+    up: "#047857", upBg: "#E7F6EF", down: "#B91C1C", downBg: "#FBEAEA",
+    gridLine: "#E3E9EF", actual: "#0E7490", baseline: "#8A99AB", adjusted: "#D97706",
+    chipBg: "#EDF1F5",
+  },
+  dark: {
+    bg: "#0B1420", surface: "#121E2E", surfaceAlt: "#182636", border: "#22344A",
+    ink: "#E8EEF5", sub: "#9AABBF", faint: "#67788C",
+    brand: "#38BDD8", brandSoft: "#0F2A36",
+    amber: "#F5A623", amberBg: "#2E2210",
+    up: "#34D399", upBg: "#0E2B22", down: "#F87171", downBg: "#2E1518",
+    gridLine: "#1D2C3F", actual: "#38BDD8", baseline: "#67788C", adjusted: "#F5A623",
+    chipBg: "#182636",
+  },
+};
+
+/* -------------------- 4-0. 데모 모드 (API 비용 없이 체험) -------------------- */
+/*  실제 Anthropic API를 호출하지 않되, 상품별로 실제 검색해서 확인한 최근 뉴스
+    기사(제목·언론사·날짜·URL)를 기반으로 분석 결과를 미리 구성해둡니다.
+    링크를 클릭하면 실제 기사 원문으로 이동합니다. API 키가 없거나 비용을 쓰고
+    싶지 않을 때 사용합니다. 설정에서 "데모 모드"를 끄면 실제 /api/forecast
+    호출(실서비스 모드)로 전환됩니다. */
+const DEMO_SCENARIOS = {
+  p1: { adjustment_percent: 22, direction: "increase", confidence: "high",
+    reason: "기상청이 2026년 여름 평균기온이 평년보다 높을 확률을 90%로 전망한 가운데, 냉감·리넨 등 통기성 소재 의류 수요가 예년보다 이른 시점부터 늘고 있다는 보도가 이어지고 있습니다. 실제 주요 브랜드의 냉감 라인 판매액이 전년 대비 두 자릿수 이상 늘어난 것으로 확인되어 상향 조정의 근거가 명확합니다.",
+    news_summary: "탑텐의 냉감 티셔츠 판매액이 전년 대비 50% 증가했고, 패션 플랫폼의 쿨링 티셔츠 거래액도 65% 늘어난 것으로 보도되었습니다. 통기성·리넨 소재 의류 전반의 수요가 예년보다 빠르게 커지는 추세입니다.",
+    key_factors: ["기상청 여름 고온 확률 90%", "냉감·통기성 소재 판매 급증", "리넨 소재 수요 조기 확대"],
+    sources: [
+      { title: "여름 전부터 산다…탑텐, 냉감 의류 판매액 50% 증가", source: "한국경제", date: "2026.05.18", url: "https://www.hankyung.com/article/202605184088g" },
+      { title: "'올 여름 역대급 무더위라더니'…벌써부터 불티난 제품들", source: "이투데이", date: "2026.06.11", url: "https://v.daum.net/v/20260611073249463" },
+    ] },
+  p2: { adjustment_percent: 30, direction: "increase", confidence: "high",
+    reason: "이른 더위로 반팔·냉감 의류 검색량과 거래액이 동시에 급증하고 있다는 보도가 다수 확인됩니다. 특히 무신사에서 반소매 티셔츠 검색량이 전년 대비 6배 이상 늘었다는 수치는 즉각적인 구매 전환 가능성을 시사합니다.",
+    news_summary: "무신사에서 반소매 티셔츠 검색량이 전년 동기 대비 6배 이상 급증했고 거래액도 25% 늘었습니다. 젝시믹스 등에서도 냉감 반팔 제품군 매출이 최근 2주간 전년 대비 33% 이상 증가한 것으로 나타났습니다.",
+    key_factors: ["반소매 티셔츠 검색량 6배 급증", "냉감 제품군 매출 33%↑", "이른 더위로 구매 시점 앞당겨짐"],
+    sources: [
+      { title: "젝시믹스, 앞당겨진 여름 수요에 냉감 의류 판매 확대", source: "뉴스톱", date: "2026.05.28", url: "https://www.newstopkorea.com/news/articleView.html?idxno=45195" },
+      { title: "예년보다 빠른 더위에...여름 제품 판매 늘리는 의류업계", source: "이투데이", date: "2026.04.21", url: "https://v.daum.net/v/20260421110003953" },
+    ] },
+  p3: { adjustment_percent: -15, direction: "decrease", confidence: "medium",
+    reason: "이번 여름 패딩 관련 신규 보도는 많지 않지만, 지난해 같은 시기(2025년 7~8월) 기사를 보면 홈쇼핑·유통업계가 여름철 '역시즌 마케팅'으로 겨울 재고를 대폭 할인 판매하는 패턴이 매년 반복되고 있습니다. 이는 정가 판매보다는 할인 채널 소진에 의존하는 구조를 시사하므로, 정규 발주는 다소 보수적으로 접근하는 것이 안전합니다.",
+    news_summary: "[작년 동시기 보도] 현대홈쇼핑·롯데홈쇼핑 등이 한여름에 패딩·코트를 최대 50~80% 할인 판매하는 '역시즌 마케팅'을 확대했고, 겨울 아우터 주문 건수가 전년 대비 약 2배 늘었다고 보도되었습니다.",
+    key_factors: ["여름철 역시즌 할인 마케팅 매년 반복", "정가 판매 비수기", "할인 채널 의존도 높음"],
+    sources: [
+      { title: "'폭염 속 불티나는 겨울옷?'…홈쇼핑, '역시즌 마케팅' 승부수", source: "시사오늘", date: "2025.08.08", url: "https://www.sisaon.co.kr/news/articleView.html?idxno=174184" },
+      { title: "\"여름철 패딩 구매 어때요\"…역시즌 마케 전개하는 유통", source: "매일일보", date: "2025.07.17", url: "http://www.m-i.kr/news/articleView.html?idxno=1261058" },
+    ] },
+  p4: { adjustment_percent: 4, direction: "increase", confidence: "medium",
+    reason: "데님은 여전히 핵심 아이템으로 보도되지만, 최근 트렌드 기사들은 '와이드 핏'의 인기가 한풀 꺾이고 스트레이트·배럴 핏으로 무게중심이 이동하고 있다고 전합니다. 데님 카테고리 자체의 수요는 견조하나, 와이드 실루엣에 집중된 재고는 다소 보수적으로 늘리는 것이 안전해 소폭 상향에 그칩니다.",
+    news_summary: "보그 코리아·무신사 등 패션 매체들은 2026년 데님 트렌드로 스트레이트·배럴 핏의 부상을 공통적으로 보도했습니다. 와이드 핏은 여전히 스테디셀러지만 신규 트렌드의 중심에서는 다소 밀려난 것으로 분석됩니다.",
+    key_factors: ["데님 카테고리 전반은 견조", "와이드 핏 인기 둔화 조짐", "스트레이트·배럴 핏으로 트렌드 이동"],
+    sources: [
+      { title: "청바지, 이렇게 바뀝니다, 2026년 청바지 트렌드 9", source: "보그 코리아", date: "2026.02.24", url: "https://www.vogue.co.kr/2026/02/03/%EC%B2%AD%EB%B0%94%EC%A7%80-%EC%9D%B4%EB%A0%87%EA%B2%8C-%EB%B0%94%EB%80%9D%EB%8B%88%EB%8B%A4-2026%EB%85%84-%EC%B2%AD%EB%B0%94%EC%A7%80-%ED%8A%B8%EB%A0%8C%EB%93%9C-9/" },
+      { title: "2026년 트렌드, 지금 입어야 할 데님", source: "무신사", date: "2026.04.15", url: "https://www.musinsa.com/content/1481467079225531565" },
+    ] },
+  p5: { adjustment_percent: -6, direction: "decrease", confidence: "medium",
+    reason: "니트 가디건은 전통적인 간절기 상품이라 한여름 수요가 낮은 편이지만, 최근 트렌드 기사는 얇은 가디건이 여름철 자외선 차단용 '살안타템'으로 착용되는 흐름도 함께 보도하고 있습니다. 완전한 비수기로 단정하기보다는, 완만한 하향 조정에 그치는 것이 합리적입니다.",
+    news_summary: "한경비즈니스는 계절 경계가 흐려지며 여름에도 얇은 가디건을 자외선 차단 아이템으로 착용하는 트렌드가 나타나고 있다고 보도했습니다. 다만 겨울용 니트 가디건 자체의 성수기는 가을 이후로 분석됩니다.",
+    key_factors: ["간절기 주력 상품 특성상 여름 비수기", "얇은 가디건의 여름철 대체 수요 존재", "본격 성수기는 가을 이후"],
+    sources: [
+      { title: "2026년 패션 트렌드는 'S.P.E.C.T.R.U.M'", source: "한경비즈니스", date: "2026.01.14", url: "https://magazine.hankyung.com/business/article/202601149521b" },
+      { title: "모두의 옷장 속에 하나쯤 있는 2026년 스타일 메가 트렌드", source: "더블유 코리아", date: "2026.02.05", url: "https://www.wkorea.com/2026/02/03/%EB%AA%A8%EB%91%90%EC%9D%98-%EC%98%B7%EC%9E%A5-%EC%86%8D%EC%97%90-%ED%95%98%EB%82%98%EC%AF%A4-%EC%9E%88%EB%8A%94-2026%EB%85%84-%EC%8A%A4%ED%83%80%EC%9D%BC-%EB%A9%94%EA%B0%80-%ED%8A%B8%EB%A0%8C/" },
+    ] },
+};
+
+async function runDemoForecast({ product, keyword }) {
+  // 실제 호출처럼 느껴지도록 약간의 지연만 흉내내고, 네트워크 요청은 전혀 발생하지 않습니다.
+  await new Promise((r) => setTimeout(r, 900 + Math.random() * 500));
+  const base = DEMO_SCENARIOS[product.id] || DEMO_SCENARIOS.p1;
+  return {
+    ...base,
+    news_summary: `[실제 보도 기반 데모 · "${keyword}" 키워드] ${base.news_summary}`,
+  };
+}
+
+/* ------------------------------ 4. LLM 호출 ------------------------------ */
+/*  브라우저는 Anthropic API를 직접 호출하지 않습니다.
+    대신 우리 서버의 /api/forecast(백엔드 프록시)로 프롬프트만 전달하고,
+    실제 API 키 사용과 Anthropic 호출은 서버(app/api/forecast/route.js)에서
+    환경변수(ANTHROPIC_API_KEY)로 처리합니다. → 키가 브라우저에 절대 노출되지 않습니다. */
+
+async function runNewsForecast({ product, keyword, model }) {
+  const recent13 = product.sales.slice(-13);
+  const base = baselineForecast(product.sales);
+  const labels = Array.from({ length: 13 }, (_, i) => weekLabel(13 + i));
+
+  const prompt = `당신은 소규모 의류 이커머스의 SCM(공급망) 수요예측 애널리스트입니다.
+
+[상품 정보]
+- 상품명: ${product.name} (SKU: ${product.sku})
+- 현재 재고: ${product.inventory}개 / 입고 리드타임: ${product.leadTime}일
+- 최근 13주 주간 판매량 (${labels[0]} ~ ${labels[12]} 주차): ${recent13.join(", ")}
+- 기존 통계 기반 향후 4주 예측 판매량: ${base.join(", ")} (합계 ${base.reduce((a, b) => a + b, 0)}개)
+
+[임무]
+1. 웹 검색 도구로 "${keyword}" 관련 최신 뉴스·동향(날씨, 물류, 소비 트렌드 등)을 검색하세요. 오늘은 2026년 7월 9일입니다.
+2. 검색 결과가 위 상품의 향후 4주 수요에 미칠 영향을 분석하세요.
+3. 기존 예측치 대비 발주량(수요 예측)을 몇 % 조정해야 할지 판단하세요.
+
+[출력 형식 — 매우 중요]
+설명 문장이나 마크다운 없이, 아래 JSON 객체 하나만 출력하세요:
+{
+  "adjustment_percent": <정수, -50 ~ 50. 상향은 양수, 하향은 음수, 유지면 0>,
+  "direction": "<increase | decrease | maintain>",
+  "confidence": "<high | medium | low>",
+  "reason": "<조정 사유 2~3문장, 한국어>",
+  "news_summary": "<검색된 핵심 뉴스/동향 요약 1~2문장, 한국어>",
+  "key_factors": ["<핵심 요인1>", "<핵심 요인2>", "<핵심 요인3>"]
+}`;
+
+  // 🔒 프록시 호출: 브라우저 → /api/forecast (같은 도메인) → 서버가 Anthropic API 호출
+  const res = await fetch("/api/forecast", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, prompt }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error || `API 오류 (HTTP ${res.status})`);
+
+  // 텍스트 블록 병합 → JSON 추출
+  const text = (data.content || []).map((b) => (b.type === "text" ? b.text : "")).filter(Boolean).join("\n");
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("AI 응답에서 JSON을 찾지 못했습니다. 다시 시도해 주세요.");
+  const parsed = JSON.parse(match[0]);
+  const pct = Math.max(-50, Math.min(50, Math.round(Number(parsed.adjustment_percent) || 0)));
+
+  // 뉴스 근거(출처) 수집: 웹 검색 결과 블록 + 텍스트 인용(citations)
+  const sources = [];
+  (data.content || []).forEach((b) => {
+    if (b.type === "web_search_tool_result" && Array.isArray(b.content)) {
+      b.content.forEach((r) => {
+        if (r && r.type === "web_search_result" && r.url) sources.push({ url: r.url, title: r.title || r.url });
+      });
+    }
+    if (b.type === "text" && Array.isArray(b.citations)) {
+      b.citations.forEach((c) => { if (c && c.url) sources.push({ url: c.url, title: c.title || c.url }); });
+    }
+  });
+  const seen = new Set();
+  const uniqueSources = sources.filter((s) => (seen.has(s.url) ? false : (seen.add(s.url), true))).slice(0, 4);
+
+  return { ...parsed, adjustment_percent: pct, sources: uniqueSources };
+}
+
+/* ------------------------------ 5. 컴포넌트 ------------------------------ */
+
+export default function Dashboard() {
+  const [mode, setMode] = useState("light");
+  const t = THEMES[mode];
+
+  const [selectedId, setSelectedId] = useState("p1");
+  const [keyword, setKeyword] = useState(PRODUCTS[0].keyword);
+  const [model, setModel] = useState("claude-sonnet-4-6");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [demoMode, setDemoMode] = useState(true); // 기본 ON: API 키·비용 없이 바로 체험 가능
+  const [demoSeason, setDemoSeason] = useState(() => seasonKeyForMonth(TODAY.getMonth() + 1)); // 계절 시뮬레이터 탭
+  // 선택한 계절의 대표 월로 만든 "가상 기준일" — 안전재고·유지비율 계산에 사용됩니다.
+  // (발주일자·입고희망일 등 실제 날짜 표기는 계속 TODAY를 사용합니다)
+  const seasonSimDate = useMemo(() => {
+    const repMonth = { spring: 4, summer: 7, fall: 10, winter: 1 }[demoSeason] ?? TODAY.getMonth() + 1;
+    return new Date(2026, repMonth - 1, 7);
+  }, [demoSeason]);
+  const isSimulated = demoSeason !== seasonKeyForMonth(TODAY.getMonth() + 1);
+
+  // 재고 수량은 사용자가 직접 수정할 수 있도록 상태로 관리 (나머지 필드는 Mock 데이터 그대로 사용)
+  const [products, setProducts] = useState(() => PRODUCTS.map((p) => ({ ...p })));
+  const updateInventory = useCallback((id, rawValue) => {
+    const num = Math.max(0, Math.min(999999, Math.round(Number(rawValue) || 0)));
+    setProducts((prev) => prev.map((p) => (p.id === id ? { ...p, inventory: num } : p)));
+  }, []);
+
+  const [loading, setLoading] = useState(false);
+
+  // 회사 정보(가상 프로필)는 사용자가 직접 수정할 수 있도록 상태로 관리
+  const [companyInfo, setCompanyInfo] = useState({
+    name: "린넨앤코 (Linen&Co.)",
+    badge: "1인~소수 인원 운영 · 스마트스토어/자사몰 기반",
+    revenue: "약 3억원",
+    staff: "2명",
+    budget: "약 2,000만원",
+    warehouse: "소형 임대창고 1곳",
+  });
+  const updateCompanyInfo = (key, value) => setCompanyInfo((c) => ({ ...c, [key]: value }));
+  const [error, setError] = useState(null);
+  const [reports, setReports] = useState([]); // 최신 리포트가 앞
+  const [adjustments, setAdjustments] = useState({}); // productId → percent
+  const [batch, setBatch] = useState(null); // { done, total, name } — 전체 SKU 일괄 분석 진행 상태
+  const [showBt, setShowBt] = useState(false); // 백테스트 상세 표 열기/닫기
+
+  // ---- PWA 설치 유도 (홈 화면에 추가) ----
+  const [installPrompt, setInstallPrompt] = useState(null);
+  useEffect(() => {
+    const handler = (e) => {
+      e.preventDefault();
+      setInstallPrompt(e); // 브라우저 기본 배너 대신 우리 버튼으로 유도
+    };
+    window.addEventListener("beforeinstallprompt", handler);
+    return () => window.removeEventListener("beforeinstallprompt", handler);
+  }, []);
+  const installApp = async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice;
+    setInstallPrompt(null); // 선택 후에는 다시 뜨지 않도록 정리
+  };
+
+  const product = products.find((p) => p.id === selectedId);
+  const productSeason = useMemo(() => getSeasonInfo(product, seasonSimDate), [product, seasonSimDate]);
+
+  /* ---- KPI 계산 ---- */
+  const kpi = useMemo(() => {
+    const totalInv = products.reduce((a, p) => a + p.inventory, 0);
+    const lowStock = products.filter((p) => {
+      const avg4 = p.sales.slice(-4).reduce((a, b) => a + b, 0) / 4;
+      return p.inventory < avg4 * 2; // 2주치 미만이면 품절 임박
+    });
+    const totalValue = products.reduce((a, p) => a + p.inventory * p.unitCost, 0); // 재고 자산가치
+    // 상품별 계절(성수기/비수기/평시)에 따라 유지비율이 다르므로, 상품별로 계산 후 합산
+    const holding = products.reduce((a, p) => {
+      const season = getSeasonInfo(p, seasonSimDate);
+      return a + p.inventory * p.unitCost * season.holding;
+    }, 0);
+    const avgHoldingRate = totalValue > 0 ? holding / totalValue : 0.02; // 표시용 가중평균 유지비율
+    return { totalInv, lowStock, totalValue, holding, avgHoldingRate };
+  }, [products, seasonSimDate]);
+  const lowStockIds = useMemo(() => new Set(kpi.lowStock.map((p) => p.id)), [kpi.lowStock]);
+
+  /* ---- 차트 데이터: 최근 13주 실적 + 4주 예측 (계절 시뮬레이터 반영) ---- */
+  const chartData = useMemo(() => {
+    const recent13 = product.sales.slice(-13);
+    const base = seasonalForecast(product, seasonSimDate); // 계절 배율이 곱해진 예측
+    const pct = adjustments[product.id];
+    const rows = recent13.map((v, i) => ({
+      week: weekLabel(13 + i), actual: v, baseline: null, adjusted: null,
+    }));
+    // 예측선이 마지막 실적점에서 이어지도록 연결점 부여
+    const last = rows[rows.length - 1];
+    last.baseline = last.actual;
+    if (pct != null) last.adjusted = last.actual;
+    base.forEach((v, i) => {
+      rows.push({
+        week: weekLabel(26 + i),
+        actual: null,
+        baseline: v,
+        adjusted: pct != null ? Math.round(v * (1 + pct / 100)) : null,
+      });
+    });
+    return rows;
+  }, [product, adjustments, seasonSimDate]);
+
+  /* ---- 예측 정확도 백테스트 (선택 상품) ---- */
+  const bt = useMemo(() => backtest(product.sales), [product]);
+
+  /* ---- 뉴스 분석 실행 (공통 코어) ---- */
+  const analyzeProduct = useCallback(async (prod, kw) => {
+    const r = demoMode
+      ? await runDemoForecast({ product: prod, keyword: kw })
+      : await runNewsForecast({ product: prod, keyword: kw, model });
+    const season = getSeasonInfo(prod, seasonSimDate); // 성수기/비수기/평시에 따라 안전재고 비율이 달라짐 (계절 시뮬레이터 반영)
+    const base = seasonalForecast(prod, seasonSimDate); // 계절 배율이 곱해진 예측 — 그래프와 동일한 기준
+    const baseSum = base.reduce((a, b) => a + b, 0);
+    const adjSum = Math.round(baseSum * (1 + r.adjustment_percent / 100));
+    const orderQty = Math.max(0, adjSum - prod.inventory + Math.round(adjSum * season.safetyStock));
+    const fin = financialImpact(prod, baseSum, adjSum, season);
+    setAdjustments((m) => ({ ...m, [prod.id]: r.adjustment_percent }));
+    setReports((list) => [
+      {
+        id: `${Date.now()}-${prod.id}`, productName: prod.name, sku: prod.sku, keyword: kw,
+        baseSum, adjSum, orderQty, fin, isDemo: demoMode, season,
+        unitCost: prod.unitCost, price: prod.price, leadTime: prod.leadTime, // 발주서 생성용 정보
+        finalQty: null, // 관리자가 최종 확정한 발주 수량 (승인 시 채워짐)
+        status: "pending", decidedAt: null, // 승인/반려 워크플로 상태
+        time: new Date().toLocaleString("ko-KR"), ...r,
+      },
+      ...list,
+    ]);
+  }, [model, demoMode, seasonSimDate]);
+
+  /* ---- 단건 분석 ---- */
+  const analyze = useCallback(async () => {
+    if (!keyword.trim() || loading || batch) return;
+    setLoading(true);
+    setError(null);
+    try {
+      await analyzeProduct(product, keyword.trim());
+    } catch (e) {
+      setError(e.message || "분석 중 오류가 발생했습니다.");
+    } finally {
+      setLoading(false);
+    }
+  }, [product, keyword, loading, batch, analyzeProduct]);
+
+  /* ---- 전체 SKU 일괄 분석 (상품별 기본 키워드로 순차 실행) ---- */
+  const analyzeAll = useCallback(async () => {
+    if (loading || batch) return;
+    setError(null);
+    const failed = [];
+    for (let i = 0; i < products.length; i++) {
+      const p = products[i];
+      setBatch({ done: i, total: products.length, name: p.name });
+      try {
+        await analyzeProduct(p, p.keyword);
+      } catch (e) {
+        failed.push(p.name); // 한 상품 실패해도 나머지는 계속 진행
+      }
+    }
+    setBatch(null);
+    if (failed.length) setError(`일부 상품 분석에 실패했습니다: ${failed.join(", ")}`);
+  }, [loading, batch, analyzeProduct, products]);
+
+  /* ---- AI 제안 승인/반려 ---- */
+  const decide = useCallback((id, status) => {
+    setReports((list) => list.map((r) =>
+      r.id === id ? { ...r, status, decidedAt: new Date().toLocaleString("ko-KR") } : r
+    ));
+  }, []);
+
+  // 결정 취소(되돌리기): 승인/반려된 리포트를 다시 대기 상태로 되돌림
+  const undoDecision = useCallback((id) => {
+    setReports((list) => list.map((r) =>
+      r.id === id ? { ...r, status: "pending", decidedAt: null, finalQty: null } : r
+    ));
+  }, []);
+
+  // ---- 발주 수량 최종 확인/수정 팝업 ----
+  const [orderModal, setOrderModal] = useState(null); // { id, qty } — 승인 전 발주 수량 확정 단계
+  const openOrderModal = (r) => setOrderModal({ id: r.id, qty: r.orderQty });
+  const confirmOrder = () => {
+    if (!orderModal) return;
+    const qty = Math.max(0, Math.round(Number(orderModal.qty) || 0));
+    setReports((list) => list.map((r) =>
+      r.id === orderModal.id
+        ? { ...r, status: "approved", finalQty: qty, decidedAt: new Date().toLocaleString("ko-KR") }
+        : r
+    ));
+    const approved = reports.find((r) => r.id === orderModal.id);
+    setOrderModal(null);
+    if (approved) setPoPreview({ ...approved, finalQty: qty, status: "approved" }); // 승인 즉시 발주서 미리보기
+  };
+
+  // ---- 발주서 자동 생성 ----
+  const [poPreview, setPoPreview] = useState(null); // 발주서 미리보기 대상 리포트
+  const addDays = (date, days) => { const d = new Date(date); d.setDate(d.getDate() + days); return d; };
+  const fmtDate = (d) => `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, "0")}.${String(d.getDate()).padStart(2, "0")}`;
+
+  const buildPOText = (r) => {
+    const qty = r.finalQty ?? r.orderQty;
+    const supply = qty * (r.unitCost || 0);
+    const vat = Math.round(supply * 0.1);
+    const total = supply + vat;
+    const poNo = `PO-${r.sku}-${TODAY.getFullYear()}${String(TODAY.getMonth() + 1).padStart(2, "0")}${String(TODAY.getDate()).padStart(2, "0")}`;
+    return [
+      "발주서 (Purchase Order)",
+      "====================================",
+      `발주번호: ${poNo}`,
+      `발주일자: ${fmtDate(TODAY)}`,
+      `공급업체: (실제 발주 시 공급업체 정보를 입력하세요)`,
+      "------------------------------------",
+      `품목명: ${r.productName}`,
+      `SKU: ${r.sku}`,
+      `발주 수량: ${fmt(qty)} 개`,
+      `단가: ${fmtWon(r.unitCost || 0)}`,
+      `공급가액: ${fmtWon(supply)}`,
+      `부가세(10%): ${fmtWon(vat)}`,
+      `합계금액: ${fmtWon(total)}`,
+      `입고 희망일: ${fmtDate(addDays(TODAY, r.leadTime || 0))} (리드타임 ${r.leadTime}일 기준)`,
+      "------------------------------------",
+      `AI 분석 근거: ${r.reason || "-"}`,
+      `뉴스 요약: ${r.news_summary || "-"}`,
+      "====================================",
+      "본 발주서는 대시보드에서 자동 생성된 참고용 문서이며, 실제 발주 전 공급업체 정보와 금액을 반드시 확인하세요.",
+    ].join("\n");
+  };
+
+  const downloadPO = (r) => {
+    const text = buildPOText(r);
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `발주서_${r.sku}_${TODAY.getFullYear()}${String(TODAY.getMonth() + 1).padStart(2, "0")}${String(TODAY.getDate()).padStart(2, "0")}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  // ---- 이메일 발송 (Gmail 웹 작성창 방식 — 서버·API 키 없이 새 탭으로 열어줌) ----
+  const [supplierEmail, setSupplierEmail] = useState("");
+  const emailPO = (r) => {
+    const subject = `[발주서] ${r.productName} (${r.sku}) 발주 요청 — ${fmt(r.finalQty ?? r.orderQty)}개`;
+    const body = buildPOText(r);
+    const to = supplierEmail.trim();
+    // Gmail 웹 작성창을 새 탭으로 열어 제목·본문을 채워줌 (기본 메일 앱 설정과 무관하게 항상 동작)
+    const url = `https://mail.google.com/mail/?view=cm&fs=1&tf=1&to=${encodeURIComponent(to)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    window.open(url, "_blank", "noopener,noreferrer");
+  };
+
+  const selectProduct = (id) => {
+    setSelectedId(id);
+    setKeyword(products.find((p) => p.id === id).keyword);
+    setError(null);
+  };
+
+  /* ---- 공용 스타일 ---- */
+  const card = { background: t.surface, border: `1px solid ${t.border}`, borderRadius: 14 };
+  const label = { fontSize: 11, letterSpacing: "0.08em", fontWeight: 600, color: t.faint, textTransform: "uppercase" };
+
+  return (
+    <div style={{ minHeight: "100vh", background: t.bg, color: t.ink, fontFamily: "'IBM Plex Sans KR','Pretendard',system-ui,sans-serif", transition: "background .25s,color .25s" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap');
+        * { box-sizing: border-box; }
+        input, select, button { font-family: inherit; }
+        .num { font-variant-numeric: tabular-nums; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+        @media print {
+          body * { visibility: hidden; }
+          .po-printable, .po-printable * { visibility: visible; }
+          .po-printable { position: absolute; top: 0; left: 0; width: 100% !important; max-width: 100% !important; box-shadow: none !important; }
+          .po-modal-overlay { position: static !important; background: none !important; }
+          .no-print { display: none !important; }
+        }
+        @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .45 } }
+        @keyframes ctaGlow {
+          0%,100% { box-shadow: 0 6px 20px rgba(14,116,144,.38), 0 0 0 0 rgba(14,116,144,.25); }
+          50% { box-shadow: 0 10px 32px rgba(14,116,144,.5), 0 0 0 8px rgba(14,116,144,0); }
+        }
+        .cta-btn { transition: transform .15s ease, box-shadow .15s ease; }
+        .cta-btn:hover:not(:disabled) { transform: translateY(-2px) scale(1.01); }
+        .cta-btn:active:not(:disabled) { transform: translateY(0) scale(0.99); }
+        @keyframes iconFloat { 0%,100% { transform: translateY(0) scale(1.15); } 50% { transform: translateY(-4px) scale(1.15); } }
+        .season-tab { transition: transform .15s ease, background .15s ease, border-color .15s ease; }
+        .season-tab:hover { transform: translateY(-2px); }
+        .season-tab-icon { display: inline-block; transition: transform .15s ease; }
+        .season-tab:hover .season-tab-icon { animation: iconFloat 1s ease-in-out infinite; }
+      `}</style>
+
+      {/* ===== 헤더 ===== */}
+      <header style={{ borderBottom: `1px solid ${t.border}`, background: t.surface }}>
+        <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div style={{ width: 34, height: 34, borderRadius: 9, background: t.brand, display: "flex", alignItems: "center", justifyContent: "center", color: mode === "light" ? "#fff" : "#0B1420", fontWeight: 700, fontSize: 15 }}>AI</div>
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 16, lineHeight: 1.1 }}>소상공인 <span style={{ color: t.brand }}>AI 재고관리 대시보드</span></div>
+              <div style={{ fontSize: 11.5, color: t.sub }}>AI 뉴스 반영 수요예측 · 재고관리 대시보드 — 2026.07.09 기준</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {installPrompt && (
+              <button onClick={installApp} title="홈 화면에 앱으로 설치"
+                style={{
+                  borderRadius: 9, padding: "7px 14px", fontSize: 13, fontWeight: 700, border: "none", cursor: "pointer",
+                  background: `linear-gradient(135deg, ${t.brand}, ${t.adjusted})`, color: "#fff",
+                  boxShadow: `0 4px 14px ${hexToRgba(t.brand, 0.35)}`,
+                }}>
+                ⬇️ 앱 설치
+              </button>
+            )}
+            <button onClick={() => setMode(mode === "light" ? "dark" : "light")} title="테마 전환"
+              style={{ ...card, borderRadius: 9, padding: "7px 12px", fontSize: 13, color: t.sub, cursor: "pointer" }}>
+              {mode === "light" ? "🌙 다크" : "☀️ 라이트"}
+            </button>
+            <button onClick={() => setSettingsOpen(true)}
+              style={{ ...card, borderRadius: 9, padding: "7px 12px", fontSize: 13, color: t.sub, cursor: "pointer" }}>
+              ⚙️ 설정
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto px-6 py-6 flex flex-col gap-6">
+
+        {/* ===== 회사 정보 카드 (재고 기준의 전제가 되는 사업 규모) ===== */}
+        <section style={card} className="p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2" style={{ marginBottom: 12 }}>
+            <div>
+              <div style={label}>회사 정보 (가상 프로필) <span style={{ color: t.faint, fontWeight: 500, textTransform: "none", letterSpacing: 0 }}>· 클릭해서 수정 가능</span></div>
+              <input
+                value={companyInfo.name}
+                onChange={(e) => updateCompanyInfo("name", e.target.value)}
+                style={{
+                  fontWeight: 700, fontSize: 15, color: t.ink, background: "transparent", border: "none",
+                  outline: "none", padding: "2px 4px", borderRadius: 6, minWidth: 160, marginTop: 4, display: "block",
+                }}
+                onFocus={(e) => (e.target.style.background = t.surfaceAlt)}
+                onBlur={(e) => (e.target.style.background = "transparent")}
+              />
+            </div>
+            <input
+              value={companyInfo.badge}
+              onChange={(e) => updateCompanyInfo("badge", e.target.value)}
+              style={{
+                background: t.brandSoft, color: t.brand, borderRadius: 999, padding: "4px 12px", fontSize: 11, fontWeight: 700,
+                border: "none", outline: "none", textAlign: "center", minWidth: 220,
+              }}
+            />
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            {[
+              { key: "revenue", label: "연매출 규모", editable: true },
+              { key: "staff", label: "직원 수", editable: true },
+              { key: "sku", label: "취급 SKU 수", editable: false, value: `${products.length}종` },
+              { key: "budget", label: "월 재고 예산", editable: true },
+              { key: "warehouse", label: "창고 형태", editable: true },
+            ].map((it) => (
+              <div key={it.key} style={{ background: t.surfaceAlt, borderRadius: 10, padding: "10px 12px" }}>
+                <div style={{ fontSize: 10.5, color: t.faint, fontWeight: 600 }}>{it.label}</div>
+                {it.editable ? (
+                  <input
+                    value={companyInfo[it.key]}
+                    onChange={(e) => updateCompanyInfo(it.key, e.target.value)}
+                    className="num"
+                    style={{
+                      fontSize: 14, fontWeight: 700, color: t.ink, marginTop: 3, width: "100%",
+                      background: "transparent", border: "none", outline: "none", padding: 0,
+                    }}
+                  />
+                ) : (
+                  <div className="num" style={{ fontSize: 14, fontWeight: 700, color: t.ink, marginTop: 3 }} title="상품 목록에 따라 자동 계산됩니다">
+                    {it.value}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 11, color: t.faint, marginTop: 10, lineHeight: 1.6 }}>
+            이 대시보드의 재고 기준(품절 임박 판단 · 안전재고 비율 · 재고 유지비율)은 위와 같은 소규모 셀러 1인 사업 규모를 전제로 설정되었습니다.
+            대기업 SCM과 달리 창고·자본 여력이 제한적이므로, 과잉 발주로 인한 현금흐름 부담을 피하는 방향에 무게를 둔 기준입니다.
+          </div>
+        </section>
+
+        {/* ===== 계절 시뮬레이터 (회사 정보와 총 재고 수량 사이) ===== */}
+        <section style={card} className="p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div style={label}>계절 시뮬레이터 <span style={{ color: t.faint, fontWeight: 500, textTransform: "none", letterSpacing: 0 }}>· 안전재고·유지비용·수요예측 계산에 전체 반영됨</span></div>
+            {isSimulated && (
+              <button onClick={() => setDemoSeason(seasonKeyForMonth(TODAY.getMonth() + 1))}
+                style={{ background: "transparent", border: "none", color: t.brand, fontSize: 11.5, fontWeight: 700, cursor: "pointer", padding: 0 }}>
+                ↺ 실제 날짜로
+              </button>
+            )}
+          </div>
+
+          <div className="grid grid-cols-4 gap-2" style={{ marginTop: 10 }}>
+            {SEASONS.map((s) => {
+              const active = s.key === demoSeason;
+              return (
+                <button key={s.key} onClick={() => setDemoSeason(s.key)} className="season-tab"
+                  style={{
+                    display: "flex", flexDirection: "column", alignItems: "center", gap: 3,
+                    padding: "12px 6px", borderRadius: 12, cursor: "pointer",
+                    background: active ? t.brandSoft : t.surfaceAlt,
+                    border: `1.5px solid ${active ? t.brand : t.border}`,
+                  }}>
+                  <span className="season-tab-icon" style={{ fontSize: 22 }}>{s.icon}</span>
+                  <span style={{ fontSize: 12.5, fontWeight: active ? 700 : 600, color: active ? t.brand : t.sub }}>{s.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {isSimulated && (
+            <div style={{ marginTop: 10, background: t.amberBg, color: t.amber, borderRadius: 10, padding: "8px 12px", fontSize: 12, fontWeight: 700 }}>
+              ⚠️ 가상 시뮬레이션 중 — 실제 오늘 날짜(7월)가 아닌 '{SEASONS.find((s) => s.key === demoSeason)?.label}' 가정으로 안전재고·유지비용·수요예측이 계산되고 있습니다.
+            </div>
+          )}
+
+          {/* 선택한 계절에 안전재고가 늘어나는(성수기) 상품 표시 */}
+          {(() => {
+            const monthsOfSeason = SEASONS.find((s) => s.key === demoSeason)?.months || [];
+            const inSeason = products.filter((p) => p.peakMonths && p.peakMonths.some((m) => monthsOfSeason.includes(m)));
+            return (
+              <div style={{ marginTop: 10, background: t.upBg, borderRadius: 10, padding: "10px 12px" }}>
+                {inSeason.length > 0 ? (
+                  <>
+                    <div style={{ fontSize: 12.5, color: t.up, fontWeight: 700, marginBottom: 6 }}>
+                      📈 {SEASONS.find((s) => s.key === demoSeason)?.label} 성수기 — 안전재고 {Math.round(SEASON_RATES.peak.safetyStock * 100)}%로 증가, 수요예측 ×{SEASON_RATES.peak.demandMultiplier.toFixed(2)}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {inSeason.map((p) => {
+                        const Icon = PRODUCT_ICONS[p.id];
+                        return (
+                          <span key={p.id} className="flex items-center gap-1.5" style={{ background: t.surface, borderRadius: 999, padding: "5px 11px", fontSize: 12, color: t.ink, fontWeight: 600 }}>
+                            <Icon style={{ width: 14, height: 14, color: t.up }} />
+                            {p.name}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ fontSize: 12.5, color: t.sub }}>
+                    {SEASONS.find((s) => s.key === demoSeason)?.label}에는 뚜렷한 성수기 상품이 없습니다 (평시 안전재고 {Math.round(SEASON_RATES.neutral.safetyStock * 100)}% 유지).
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+        </section>
+
+        {/* ===== 상단 KPI 카드 3개 ===== */}
+        <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div style={card} className="p-5">
+            <div style={label}>총 재고 수량</div>
+            <div className="num" style={{ fontSize: 30, fontWeight: 700, marginTop: 6 }}>{fmt(kpi.totalInv)}<span style={{ fontSize: 14, color: t.sub, fontWeight: 500 }}> 개</span></div>
+            <div style={{ fontSize: 12, color: t.sub, marginTop: 4, marginBottom: 10 }}>SKU {products.length}종 합산 · 수량 직접 수정 가능</div>
+            <div className="flex flex-col gap-1.5">
+              {products.map((p) => {
+                const Icon = PRODUCT_ICONS[p.id];
+                const stable = !lowStockIds.has(p.id);
+                const season = getSeasonInfo(p, seasonSimDate);
+                const seasonColor = season.key === "peak" ? t.up : season.key === "off" ? t.amber : t.faint;
+                const seasonBg = season.key === "peak" ? t.upBg : season.key === "off" ? t.amberBg : t.chipBg;
+                return (
+                  <div key={p.id} className="flex items-center justify-between" style={{ fontSize: 12, padding: "4px 0" }}>
+                    <div className="flex items-center gap-2" style={{ minWidth: 0 }}>
+                      <div style={{ width: 22, height: 22, borderRadius: 7, background: t.surfaceAlt, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                        <Icon style={{ width: 14, height: 14, color: t.brand }} />
+                      </div>
+                      <span style={{ color: t.sub, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
+                      <span title={stable ? "재고 안정 상태" : "품절 임박 — 재고 부족 주의"}
+                        style={{
+                          display: "inline-flex", alignItems: "center", justifyContent: "center",
+                          width: 15, height: 15, borderRadius: 999, flexShrink: 0,
+                          background: stable ? t.upBg : t.amberBg, color: stable ? t.up : t.amber, fontSize: 10, fontWeight: 900,
+                        }}>
+                        {stable ? "✓" : "!"}
+                      </span>
+                      <span title={`현재 ${season.label} — 안전재고 ${Math.round(season.safetyStock * 100)}% · 유지비율 ${(season.holding * 100).toFixed(1)}%`}
+                        style={{ background: seasonBg, color: seasonColor, borderRadius: 999, padding: "1px 7px", fontSize: 9.5, fontWeight: 700, flexShrink: 0 }}>
+                        {season.label}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1" style={{ flexShrink: 0, marginLeft: 8 }}>
+                      <input
+                        type="number"
+                        min={0}
+                        value={p.inventory}
+                        onChange={(e) => updateInventory(p.id, e.target.value)}
+                        className="num"
+                        style={{
+                          width: 64, textAlign: "right", fontWeight: 700, color: t.ink,
+                          background: t.surfaceAlt, border: `1px solid ${t.border}`, borderRadius: 7,
+                          padding: "3px 6px", fontSize: 12, outline: "none",
+                        }}
+                      />
+                      <span style={{ color: t.faint }}>개</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <div style={card} className="p-5">
+            <div style={label}>품절 임박 상품</div>
+            <div className="num" style={{ fontSize: 30, fontWeight: 700, marginTop: 6, color: kpi.lowStock.length ? t.amber : t.ink }}>
+              {kpi.lowStock.length}<span style={{ fontSize: 14, color: t.sub, fontWeight: 500 }}> 건</span>
+            </div>
+            <div style={{ fontSize: 12, color: t.sub, marginTop: 4 }}>
+              {kpi.lowStock.length ? `재고 2주치 미만: ${kpi.lowStock.map((p) => p.name).join(", ")}` : "모든 SKU 안정 재고 유지 중"}
+            </div>
+          </div>
+          <div style={card} className="p-5">
+            <div style={label}>이번 달 예상 재고 유지 비용</div>
+            <div className="num" style={{ fontSize: 30, fontWeight: 700, marginTop: 6 }}>{fmtWon(kpi.holding)}</div>
+            <div className="num" style={{ fontSize: 11.5, color: t.sub, marginTop: 6, background: t.surfaceAlt, borderRadius: 8, padding: "6px 9px", lineHeight: 1.5 }}>
+              {fmtWon(kpi.totalValue)} <span style={{ color: t.faint }}>(재고 자산가치)</span> × {(kpi.avgHoldingRate * 100).toFixed(2)}%<span style={{ color: t.faint }}> (계절별 가중평균 유지비율)</span> = <b style={{ color: t.ink }}>{fmtWon(kpi.holding)}</b>
+            </div>
+            <div style={{ fontSize: 10.5, color: t.faint, marginTop: 6, lineHeight: 1.5 }}>
+              성수기 {(SEASON_RATES.peak.holding * 100).toFixed(1)}% · 평시 {(SEASON_RATES.neutral.holding * 100).toFixed(1)}% · 비수기 {(SEASON_RATES.off.holding * 100).toFixed(1)}% — 상품별 계절에 따라 다르게 적용 후 합산
+            </div>
+          </div>
+        </section>
+
+        {/* ===== 중단: 뉴스 분석(좌, 먼저 노출) + 그래프(우) ===== */}
+        <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+          {/* --- 좌: 실시간 뉴스 검색 · 분석 (강조 배치) --- */}
+          <div style={{ ...card, border: `1.5px solid ${t.brand}` }} className="p-5 flex flex-col lg:col-span-1">
+            <div className="flex items-center justify-end gap-2">
+              <button onClick={() => setDemoMode(!demoMode)}
+                style={{
+                  background: demoMode ? t.amberBg : t.upBg, color: demoMode ? t.amber : t.up,
+                  border: "none", borderRadius: 999, padding: "3px 10px", fontSize: 10.5, fontWeight: 700, cursor: "pointer",
+                }}
+                title="클릭해서 모드 전환">
+                {demoMode ? "🧪 데모 모드 (비용 없음)" : "🔴 실서비스 모드 (API 호출)"}
+              </button>
+            </div>
+
+            <div style={{ ...label, marginTop: 14 }}>실시간 뉴스 반영 분석</div>
+            <p style={{ fontSize: 13, color: t.sub, margin: "8px 0 14px", lineHeight: 1.55 }}>
+              {demoMode
+                ? "지금은 데모 모드입니다. 실제 API를 호출하지 않고 미리 준비된 예시 분석 결과를 보여드립니다 — 비용이 전혀 발생하지 않습니다."
+                : "키워드로 최신 뉴스·동향을 웹에서 검색하고, 과거 판매 데이터와 함께 AI가 발주량 조정을 제안합니다. (Anthropic API 호출 — 비용 발생)"}
+            </p>
+
+            <div style={label}>분석 대상 상품</div>
+            <div className="grid grid-cols-3 gap-2" style={{ margin: "6px 0 14px" }}>
+              {products.map((p) => {
+                const Icon = PRODUCT_ICONS[p.id];
+                const active = p.id === selectedId;
+                return (
+                  <button key={p.id} onClick={() => selectProduct(p.id)} className="season-tab"
+                    style={{
+                      display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
+                      padding: "10px 6px", borderRadius: 12, cursor: "pointer",
+                      background: active ? t.brandSoft : t.surfaceAlt,
+                      border: `1.5px solid ${active ? t.brand : t.border}`,
+                      color: active ? t.brand : t.sub,
+                    }}>
+                    <Icon className="season-tab-icon" style={{ width: 26, height: 26 }} />
+                    <span style={{ fontSize: 11, fontWeight: active ? 700 : 600, color: active ? t.brand : t.ink, textAlign: "center", lineHeight: 1.3 }}>
+                      {p.name}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div style={label}>뉴스 검색 키워드</div>
+            <input
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && analyze()}
+              placeholder="예: 폭염 여름 의류 트렌드"
+              style={{ ...card, background: t.surfaceAlt, borderRadius: 10, padding: "10px 12px", fontSize: 14, color: t.ink, margin: "6px 0 14px", outline: "none", width: "100%" }}
+            />
+
+            {/* 강조된 메인 CTA 버튼: 그래프보다 먼저 눈에 띄도록 배치 + 글로우 애니메이션 */}
+            <button onClick={analyze} disabled={loading || !keyword.trim()} className="cta-btn"
+              style={{
+                borderRadius: 12, padding: "18px 18px", fontSize: 16, fontWeight: 800, letterSpacing: "0.01em",
+                border: "none", cursor: loading ? "wait" : "pointer",
+                background: loading ? t.surfaceAlt : `linear-gradient(135deg, ${t.brand}, ${t.adjusted})`,
+                color: loading ? t.sub : "#fff",
+                boxShadow: loading ? "none" : `0 8px 24px ${hexToRgba(t.brand, 0.4)}`,
+                animation: loading ? "pulse 1.4s ease-in-out infinite" : "ctaGlow 2.2s ease-in-out infinite",
+              }}>
+              {loading ? "🔎 뉴스 검색 및 AI 분석 중…" : "📰  뉴스 분석 및 발주량 예측"}
+            </button>
+
+            <button onClick={analyzeAll} disabled={loading || !!batch}
+              style={{
+                borderRadius: 10, padding: "11px 14px", fontSize: 13.5, fontWeight: 600, marginTop: 10,
+                border: `1.5px solid ${batch ? t.border : t.brand}`,
+                background: "transparent",
+                color: batch ? t.sub : t.brand,
+                cursor: batch ? "wait" : "pointer",
+                animation: batch ? "pulse 1.4s ease-in-out infinite" : "none",
+              }}>
+              {batch
+                ? `📡 일괄 분석 중 (${batch.done + 1}/${batch.total}) — ${batch.name}`
+                : "📡 전체 SKU 일괄 분석 (상품별 기본 키워드)"}
+            </button>
+
+            {loading && (
+              <div style={{ fontSize: 12.5, color: t.sub, marginTop: 10, lineHeight: 1.6 }}>
+                웹 검색 → 뉴스 요약 → 판매 데이터 대조 → 발주 조정률 산출 순으로 진행됩니다. (약 10~30초)
+              </div>
+            )}
+            {error && (
+              <div style={{ background: t.downBg, color: t.down, borderRadius: 10, padding: "10px 12px", fontSize: 13, marginTop: 12 }}>
+                {error}
+              </div>
+            )}
+
+            <div style={{ marginTop: "auto", paddingTop: 14, fontSize: 11.5, color: t.faint, lineHeight: 1.5 }}>
+              모델: <span className="num">{model}</span> · 웹 검색 도구 사용<br />
+              API 키는 서버에서만 관리됩니다 (설정 참고)
+            </div>
+          </div>
+
+          {/* --- 우: 재고 및 수요 예측 그래프 --- */}
+          <div style={card} className="p-5 lg:col-span-2">
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+              <div>
+                <div style={label}>재고 · 수요 예측</div>
+                <div className="flex items-center gap-2" style={{ marginTop: 3 }}>
+                  <div style={{ fontWeight: 700, fontSize: 16 }}>
+                    {product.name} <span style={{ fontSize: 12, color: t.faint, fontWeight: 500 }}>{product.sku}</span>
+                  </div>
+                  <span title="계절 시뮬레이터가 수요 예측선에 곱해지는 배율입니다"
+                    style={{
+                      background: productSeason.key === "peak" ? t.upBg : productSeason.key === "off" ? t.amberBg : t.chipBg,
+                      color: productSeason.key === "peak" ? t.up : productSeason.key === "off" ? t.amber : t.sub,
+                      borderRadius: 999, padding: "2px 9px", fontSize: 11, fontWeight: 700,
+                    }}>
+                    📅 {productSeason.label} 예측 ×{productSeason.demandMultiplier.toFixed(2)}
+                  </span>
+                </div>
+              </div>
+              <select value={selectedId} onChange={(e) => selectProduct(e.target.value)}
+                style={{ ...card, borderRadius: 9, padding: "8px 12px", fontSize: 13, color: t.ink, background: t.surfaceAlt, cursor: "pointer" }}>
+                {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </div>
+
+            <div style={{ width: "100%", height: 300 }}>
+              <ResponsiveContainer>
+                <ComposedChart data={chartData} margin={{ top: 8, right: 12, left: -14, bottom: 0 }}>
+                  <CartesianGrid stroke={t.gridLine} strokeDasharray="2 4" vertical={false} />
+                  <XAxis dataKey="week" tick={{ fontSize: 11, fill: t.sub }} axisLine={{ stroke: t.border }} tickLine={false} />
+                  <YAxis tick={{ fontSize: 11, fill: t.sub }} axisLine={false} tickLine={false} />
+                  <Tooltip
+                    contentStyle={{ background: t.surface, border: `1px solid ${t.border}`, borderRadius: 10, fontSize: 12.5, color: t.ink }}
+                    labelStyle={{ color: t.sub, fontWeight: 600 }}
+                    formatter={(v, name) => [v == null ? "-" : `${v}개`, name]}
+                  />
+                  <Legend wrapperStyle={{ fontSize: 12, color: t.sub }} />
+                  <ReferenceLine x={weekLabel(25)} stroke={t.faint} strokeDasharray="3 3"
+                    label={{ value: "오늘", position: "top", fontSize: 11, fill: t.faint }} />
+                  <Line name="실제 판매량 (13주)" dataKey="actual" stroke={t.actual} strokeWidth={2.4} dot={{ r: 2.5 }} connectNulls={false} />
+                  <Line name={`기존 예측 (4주, 계절 ×${productSeason.demandMultiplier.toFixed(2)})`} dataKey="baseline" stroke={t.baseline} strokeWidth={2} strokeDasharray="6 5" dot={{ r: 2.5 }} connectNulls={false} />
+                  {adjustments[product.id] != null && (
+                    <Line name={`AI 조정 예측 (${adjustments[product.id] > 0 ? "+" : ""}${adjustments[product.id]}%)`}
+                      dataKey="adjusted" stroke={t.adjusted} strokeWidth={2.4} strokeDasharray="4 4" dot={{ r: 3 }} connectNulls={false} />
+                  )}
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-4 mt-3" style={{ fontSize: 12.5, color: t.sub }}>
+              <span className="num">현재 재고 <b style={{ color: t.ink }}>{fmt(product.inventory)}개</b></span>
+              <span className="num">최근 4주 평균 판매 <b style={{ color: t.ink }}>{Math.round(product.sales.slice(-4).reduce((a, b) => a + b, 0) / 4)}개/주</b></span>
+              <span className="num">입고 리드타임 <b style={{ color: t.ink }}>{product.leadTime}일</b></span>
+            </div>
+
+            {/* 예측 정확도 검증 — 발주 의사결정을 돕는 보조 지표임을 강조 */}
+            <button onClick={() => setShowBt(!showBt)}
+              className="w-full flex items-center justify-between gap-3"
+              style={{
+                marginTop: 14, borderRadius: 12, padding: "12px 14px", cursor: "pointer", border: "none", textAlign: "left",
+                background: bt.mape <= 15 ? t.upBg : t.amberBg,
+              }}>
+              <div className="flex items-center gap-3">
+                <div style={{
+                  width: 38, height: 38, borderRadius: 10, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                  background: t.surface, fontSize: 16,
+                }}>📐</div>
+                <div>
+                  <div className="num" style={{ fontSize: 14, fontWeight: 800, color: bt.mape <= 15 ? t.up : t.amber }}>
+                    예측 정확도 검증 — MAPE {bt.mape.toFixed(1)}%
+                  </div>
+                  <div style={{ fontSize: 11.5, color: t.sub, marginTop: 1 }}>
+                    발주 결정을 돕는 참고 지표입니다 · 최종 판단은 관리자가 내려주세요
+                  </div>
+                </div>
+              </div>
+              <span style={{ color: t.faint, fontSize: 13, flexShrink: 0 }}>{showBt ? "간략히 ▲" : "자세히 ▼"}</span>
+            </button>
+
+            {/* 백테스트 상세: 마지막 4주를 숨기고 예측 → 실제와 대조. 오차는 과대/과소 방향을 빨간색 +/-로 표시 */}
+            {showBt && (
+              <div style={{ marginTop: 8, border: `1px solid ${t.border}`, borderRadius: 12, background: t.surfaceAlt, padding: 14 }}>
+                <div style={{ fontSize: 11.5, color: t.sub, lineHeight: 1.55, marginBottom: 10 }}>
+                  1~22주차 데이터만으로 23~26주차를 예측한 뒤 실제 판매량과 비교했습니다. 이 도구는 발주량을 대신 결정하지 않으며, <b style={{ color: t.ink }}>재고 관리자의 판단을 돕는 참고 자료</b>로만 활용하시기 바랍니다.
+                </div>
+                <div className="grid grid-cols-4 gap-2 num" style={{ fontSize: 12 }}>
+                  {bt.rows.map((r) => {
+                    const over = r.signedErr > 0; // true: 과대예측(+), false: 과소예측(−)
+                    return (
+                      <div key={r.week} style={{ background: t.surface, border: `1px solid ${t.border}`, borderRadius: 9, padding: "8px 10px" }}>
+                        <div style={{ color: t.faint, fontSize: 10.5, fontWeight: 600 }}>{r.week} 주차</div>
+                        <div style={{ marginTop: 3 }}>예측 <b>{r.pred}</b> · 실제 <b>{r.actual}</b></div>
+                        <div style={{ color: t.down, fontWeight: 800, marginTop: 3, fontSize: 13 }}>
+                          {over ? "+" : "−"}{Math.abs(r.signedErr).toFixed(1)}%
+                        </div>
+                        <div style={{ color: t.faint, fontSize: 10, marginTop: 1 }}>{over ? "과대예측 (예측 > 실제)" : "과소예측 (예측 < 실제)"}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* ===== 하단: AI 발주 조절 제안 리포트 ===== */}
+        <section style={card} className="p-5">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <div style={label}>AI 발주 조절 제안</div>
+              <div style={{ fontWeight: 700, fontSize: 16, marginTop: 3 }}>
+                분석 리포트 <span className="num" style={{ color: t.brand }}>{reports.length}</span>
+                {reports.length > 0 && (
+                  <span className="num" style={{ fontSize: 12, fontWeight: 600, color: t.sub, marginLeft: 10 }}>
+                    발주 반영 {reports.filter((r) => r.status === "approved").length} · 보류 {reports.filter((r) => r.status === "rejected").length} · 대기 {reports.filter((r) => r.status === "pending").length}
+                  </span>
+                )}
+              </div>
+            </div>
+            {reports.length > 0 && (
+              <button onClick={() => setReports([])} style={{ fontSize: 12.5, color: t.faint, background: "none", border: "none", cursor: "pointer" }}>
+                전체 지우기
+              </button>
+            )}
+          </div>
+
+          {reports.length === 0 ? (
+            <div style={{ border: `1.5px dashed ${t.border}`, borderRadius: 12, padding: "36px 20px", textAlign: "center", color: t.faint, fontSize: 13.5 }}>
+              아직 분석 리포트가 없습니다. 우측 상단의 <b style={{ color: t.sub }}>[뉴스 분석 및 발주량 예측]</b> 버튼으로 첫 분석을 실행해 보세요.
+            </div>
+          ) : (
+            <div className="flex flex-col gap-4">
+              {reports.map((r) => {
+                const up = r.adjustment_percent > 0, keep = r.adjustment_percent === 0;
+                const c = keep ? t.sub : up ? t.up : t.down;
+                const cBg = keep ? t.chipBg : up ? t.upBg : t.downBg;
+                const confKo = { high: "신뢰도 높음", medium: "신뢰도 보통", low: "신뢰도 낮음" }[r.confidence] || "신뢰도 보통";
+                // 델타 게이지: 기준 50% 위치에서 조정률만큼 이동 (±50% 스케일)
+                const gaugePos = 50 + r.adjustment_percent;
+                return (
+                  <div key={r.id} style={{ border: `1px solid ${t.border}`, borderRadius: 12, background: t.surfaceAlt, padding: 18 }}>
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <div style={{ fontWeight: 700, fontSize: 15 }}>
+                          {r.productName} <span style={{ fontSize: 11.5, color: t.faint, fontWeight: 500 }}>{r.sku}</span>
+                        </div>
+                        <div style={{ fontSize: 12, color: t.faint, marginTop: 3 }} className="num">
+                          키워드 “{r.keyword}” · {r.time}
+                          {r.isDemo && (
+                            <span style={{ background: t.amberBg, color: t.amber, borderRadius: 999, padding: "2px 8px", fontSize: 10.5, fontWeight: 700, marginLeft: 8 }}>
+                              🧪 데모 예시
+                            </span>
+                          )}
+                          {r.season && (
+                            <span style={{ background: t.chipBg, color: t.sub, borderRadius: 999, padding: "2px 8px", fontSize: 10.5, fontWeight: 700, marginLeft: 6 }}>
+                              📅 {r.season.label} 기준 (안전재고 {Math.round(r.season.safetyStock * 100)}% · 유지비율 {(r.season.holding * 100).toFixed(1)}%)
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span style={{ background: cBg, color: c, borderRadius: 999, padding: "6px 14px", fontSize: 15, fontWeight: 700 }} className="num">
+                          {keep ? "─ 유지" : `${up ? "▲" : "▼"} ${up ? "+" : ""}${r.adjustment_percent}%`}
+                        </span>
+                        <span style={{ background: t.chipBg, color: t.sub, borderRadius: 999, padding: "6px 10px", fontSize: 11.5, fontWeight: 600 }}>{confKo}</span>
+                      </div>
+                    </div>
+
+                    {/* 시그니처: 발주 조정 델타 게이지 */}
+                    <div style={{ margin: "16px 0 4px" }}>
+                      <div style={{ position: "relative", height: 8, borderRadius: 99, background: `linear-gradient(90deg, ${t.down}22, ${t.chipBg} 50%, ${t.up}22)` }}>
+                        <div style={{ position: "absolute", left: "50%", top: -3, width: 2, height: 14, background: t.faint, borderRadius: 2 }} />
+                        <div style={{ position: "absolute", left: `${gaugePos}%`, top: -5, width: 18, height: 18, borderRadius: 99, background: c, border: `3px solid ${t.surface}`, transform: "translateX(-50%)", transition: "left .5s ease" }} />
+                      </div>
+                      <div className="flex justify-between num" style={{ fontSize: 10.5, color: t.faint, marginTop: 6 }}>
+                        <span>-50% 하향</span><span>기존 예측 기준</span><span>+50% 상향</span>
+                      </div>
+                    </div>
+
+                    <p style={{ fontSize: 13.5, lineHeight: 1.65, margin: "12px 0 10px" }}>
+                      <b style={{ color: c }}>권장:</b> {r.reason}
+                    </p>
+                    <p style={{ fontSize: 12.5, lineHeight: 1.6, color: t.sub, margin: "0 0 12px" }}>
+                      📰 <b>뉴스 요약:</b> {r.news_summary}
+                    </p>
+
+                    {Array.isArray(r.key_factors) && r.key_factors.length > 0 && (
+                      <div className="flex flex-wrap gap-2 mb-3">
+                        {r.key_factors.map((f, i) => (
+                          <span key={i} style={{ background: t.chipBg, border: `1px solid ${t.border}`, color: t.sub, borderRadius: 999, padding: "4px 10px", fontSize: 11.5 }}>
+                            # {f}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-3 gap-3 num" style={{ fontSize: 12.5, borderTop: `1px solid ${t.border}`, paddingTop: 12 }}>
+                      <div><div style={label}>기존 4주 수요</div><div style={{ fontWeight: 700, fontSize: 15, marginTop: 3 }}>{fmt(r.baseSum)}개</div></div>
+                      <div><div style={label}>AI 조정 수요</div><div style={{ fontWeight: 700, fontSize: 15, marginTop: 3, color: c }}>{fmt(r.adjSum)}개</div></div>
+                      <div><div style={label}>권장 발주량*</div><div style={{ fontWeight: 700, fontSize: 15, marginTop: 3 }}>{fmt(r.orderQty)}개</div></div>
+                    </div>
+
+                    {/* 재무 임팩트 환산 */}
+                    {r.fin && (
+                      <div className="grid grid-cols-3 gap-3 num" style={{ fontSize: 12.5, borderTop: `1px dashed ${t.border}`, marginTop: 12, paddingTop: 12 }}>
+                        <div>
+                          <div style={label}>수요 변화량</div>
+                          <div style={{ fontWeight: 700, fontSize: 15, marginTop: 3, color: c }}>{r.fin.delta > 0 ? "+" : ""}{fmt(r.fin.delta)}개</div>
+                        </div>
+                        <div>
+                          <div style={label}>예상 매출 영향</div>
+                          <div style={{ fontWeight: 700, fontSize: 15, marginTop: 3, color: r.fin.revenue >= 0 ? t.up : t.down }}>{fmtWonSigned(r.fin.revenue)}</div>
+                        </div>
+                        <div>
+                          <div style={label}>{keep ? "리스크 없음" : "미반영 시 예상 손실**"}</div>
+                          <div style={{ fontWeight: 700, fontSize: 15, marginTop: 3, color: keep ? t.sub : t.amber }}>{keep ? "—" : fmtWon(r.fin.risk)}</div>
+                        </div>
+                      </div>
+                    )}
+                    <div style={{ fontSize: 10.5, color: t.faint, marginTop: 8, lineHeight: 1.5 }}>
+                      * 조정 수요 − 현재 재고 + 안전재고 {r.season ? Math.round(r.season.safetyStock * 100) : 15}%({r.season?.label || "평시"} 기준) 산출<br />
+                      ** 상향 미반영 시 품절 기회손실(단위 마진 기준), 하향 미반영 시 과잉재고 손실(계절별 월 유지비 {r.season ? (r.season.holding * 100).toFixed(1) : "2.0"}% + 시즌오프 처분손실 10% 가정)
+                    </div>
+
+                    {/* 뉴스 근거 링크 */}
+                    {Array.isArray(r.sources) && r.sources.length > 0 && (
+                      <div style={{ marginTop: 12 }}>
+                        <div style={label}>분석 근거 기사 {r.isDemo && <span style={{ color: t.faint, fontWeight: 500, textTransform: "none", letterSpacing: 0 }}>· 실제 보도 기반 (데모)</span>}</div>
+                        <div className="flex flex-col gap-1.5 mt-1">
+                          {r.sources.map((s, i) => (
+                            <a key={i} href={s.url} target="_blank" rel="noreferrer"
+                              style={{ display: "flex", alignItems: "baseline", gap: 6, fontSize: 12.5, color: t.brand, textDecoration: "none" }}>
+                              <span style={{ flexShrink: 0 }}>🔗</span>
+                              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.title}</span>
+                              {(s.source || s.date) && (
+                                <span className="num" style={{ color: t.faint, fontSize: 11, flexShrink: 0 }}>
+                                  {s.source}{s.source && s.date ? " · " : ""}{s.date}
+                                </span>
+                              )}
+                            </a>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 승인/반려 워크플로 (Human-in-the-loop) */}
+                    <div style={{ borderTop: `1px solid ${t.border}`, marginTop: 14, paddingTop: 12 }}>
+                      {r.status === "pending" ? (
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <button onClick={() => openOrderModal(r)}
+                            style={{ background: t.up, color: mode === "light" ? "#fff" : "#0B1420", border: "none", borderRadius: 9, padding: "9px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                            ✓ 발주 반영
+                          </button>
+                          <button onClick={() => decide(r.id, "rejected")}
+                            style={{ background: "transparent", color: t.sub, border: `1.5px solid ${t.border}`, borderRadius: 9, padding: "9px 16px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+                            보류 / 반려
+                          </button>
+                          <span style={{ fontSize: 11.5, color: t.faint, marginLeft: 4 }}>관리자 승인 시에만 발주에 반영됩니다</span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2 flex-wrap" style={{ fontSize: 12.5 }}>
+                          <span style={{
+                            background: r.status === "approved" ? t.upBg : t.chipBg,
+                            color: r.status === "approved" ? t.up : t.sub,
+                            borderRadius: 999, padding: "5px 12px", fontWeight: 700,
+                          }}>
+                            {r.status === "approved" ? `✓ 발주 반영됨 (${fmt(r.finalQty ?? r.orderQty)}개)` : "⏸ 보류됨"}
+                          </span>
+                          <span className="num" style={{ color: t.faint, fontSize: 11.5 }}>{r.decidedAt} 처리</span>
+
+                          {r.status === "approved" && (
+                            <button onClick={() => setPoPreview(r)}
+                              style={{ background: t.brandSoft, color: t.brand, border: "none", borderRadius: 999, padding: "5px 12px", fontWeight: 700, cursor: "pointer" }}>
+                              📄 발주서 보기
+                            </button>
+                          )}
+                          <button onClick={() => undoDecision(r.id)}
+                            style={{ background: "transparent", color: t.faint, border: `1px solid ${t.border}`, borderRadius: 999, padding: "5px 12px", fontWeight: 600, cursor: "pointer" }}>
+                            ↩️ 취소 (다시 검토)
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        <footer style={{ fontSize: 11.5, color: t.faint, textAlign: "center", paddingBottom: 12 }}>
+          소상공인 AI 재고관리 대시보드 · 학습용 프로토타입 — 판매 데이터는 가상(Mock)이며, AI 제안은 참고용입니다.
+        </footer>
+      </main>
+
+      {/* ===== 발주 수량 최종 확인/수정 모달 ===== */}
+      {orderModal && (() => {
+        const r = reports.find((rep) => rep.id === orderModal.id);
+        if (!r) return null;
+        const qty = Math.max(0, Math.round(Number(orderModal.qty) || 0));
+        const supply = qty * (r.unitCost || 0);
+        return (
+          <div onClick={() => setOrderModal(null)}
+            style={{ position: "fixed", inset: 0, background: "rgba(8,14,22,.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 60, padding: 20 }}>
+            <div onClick={(e) => e.stopPropagation()} style={{ ...card, width: "100%", maxWidth: 420, padding: 24 }}>
+              <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 4 }}>발주 수량 최종 확인</div>
+              <div style={{ fontSize: 12.5, color: t.sub, marginBottom: 16 }}>{r.productName} <span style={{ color: t.faint }}>{r.sku}</span></div>
+
+              <div style={{ background: t.surfaceAlt, borderRadius: 10, padding: "10px 12px", fontSize: 12.5, color: t.sub, marginBottom: 14 }}>
+                AI 권장 발주량: <b className="num" style={{ color: t.ink }}>{fmt(r.orderQty)}개</b> — 필요하면 아래에서 수량을 직접 조정한 뒤 확정하세요.
+                {r.season && (
+                  <div style={{ fontSize: 11, color: t.faint, marginTop: 4 }}>
+                    📅 {r.season.label} 기준 안전재고 {Math.round(r.season.safetyStock * 100)}% 반영됨
+                  </div>
+                )}
+              </div>
+
+              <div style={label}>최종 발주 수량</div>
+              <div className="flex items-center gap-2" style={{ margin: "6px 0 14px" }}>
+                <input
+                  type="number" min={0} autoFocus
+                  value={orderModal.qty}
+                  onChange={(e) => setOrderModal({ ...orderModal, qty: e.target.value })}
+                  className="num"
+                  style={{ ...card, background: t.surfaceAlt, borderRadius: 10, padding: "10px 12px", fontSize: 16, fontWeight: 700, color: t.ink, width: "100%", outline: "none" }}
+                />
+                <span style={{ color: t.sub, flexShrink: 0 }}>개</span>
+              </div>
+
+              <div className="num" style={{ fontSize: 12.5, color: t.sub, background: t.surfaceAlt, borderRadius: 10, padding: "10px 12px", marginBottom: 18 }}>
+                예상 공급가액: <b style={{ color: t.ink }}>{fmtWon(supply)}</b> (단가 {fmtWon(r.unitCost || 0)} × {fmt(qty)}개, 부가세 별도)
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button onClick={confirmOrder}
+                  style={{ flex: 1, background: t.up, color: mode === "light" ? "#fff" : "#0B1420", border: "none", borderRadius: 10, padding: "11px 14px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
+                  발주 확정
+                </button>
+                <button onClick={() => setOrderModal(null)}
+                  style={{ background: "transparent", color: t.sub, border: `1.5px solid ${t.border}`, borderRadius: 10, padding: "11px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+                  취소
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ===== 발주서 미리보기 모달 ===== */}
+      {poPreview && (
+        <div onClick={() => setPoPreview(null)} className="po-modal-overlay"
+          style={{ position: "fixed", inset: 0, background: "rgba(8,14,22,.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 60, padding: 20 }}>
+          <div onClick={(e) => e.stopPropagation()} className="po-printable"
+            style={{ ...card, width: "100%", maxWidth: 480, padding: 24, maxHeight: "85vh", overflowY: "auto" }}>
+            <div className="flex items-center justify-between" style={{ marginBottom: 6 }}>
+              <div style={{ fontWeight: 800, fontSize: 16 }}>📄 발주서 (Purchase Order)</div>
+              <span style={{ background: t.upBg, color: t.up, borderRadius: 999, padding: "3px 10px", fontSize: 11, fontWeight: 700 }}>자동 생성됨</span>
+            </div>
+            <div style={{ fontSize: 11.5, color: t.faint, marginBottom: 14 }}>
+              발주번호 PO-{poPreview.sku}-{TODAY.getFullYear()}{String(TODAY.getMonth() + 1).padStart(2, "0")}{String(TODAY.getDate()).padStart(2, "0")} · 발주일자 {fmtDate(TODAY)}
+            </div>
+
+            <div style={{ background: t.surfaceAlt, borderRadius: 10, padding: 14, fontSize: 12.5, lineHeight: 1.9 }}>
+              <div className="flex justify-between"><span style={{ color: t.sub }}>공급업체</span><span style={{ color: t.faint }}>(실제 발주 시 입력)</span></div>
+              <div className="flex justify-between"><span style={{ color: t.sub }}>품목명</span><b>{poPreview.productName}</b></div>
+              <div className="flex justify-between"><span style={{ color: t.sub }}>SKU</span><span className="num">{poPreview.sku}</span></div>
+              <div className="flex justify-between"><span style={{ color: t.sub }}>발주 수량</span><b className="num">{fmt(poPreview.finalQty ?? poPreview.orderQty)}개</b></div>
+              <div className="flex justify-between"><span style={{ color: t.sub }}>단가</span><span className="num">{fmtWon(poPreview.unitCost || 0)}</span></div>
+              <div className="flex justify-between"><span style={{ color: t.sub }}>공급가액</span><span className="num">{fmtWon((poPreview.finalQty ?? poPreview.orderQty) * (poPreview.unitCost || 0))}</span></div>
+              <div className="flex justify-between"><span style={{ color: t.sub }}>부가세(10%)</span><span className="num">{fmtWon(Math.round((poPreview.finalQty ?? poPreview.orderQty) * (poPreview.unitCost || 0) * 0.1))}</span></div>
+              <div className="flex justify-between" style={{ borderTop: `1px dashed ${t.border}`, marginTop: 4, paddingTop: 4 }}>
+                <span style={{ color: t.ink, fontWeight: 700 }}>합계금액</span>
+                <b className="num" style={{ color: t.brand, fontSize: 14 }}>
+                  {fmtWon(Math.round((poPreview.finalQty ?? poPreview.orderQty) * (poPreview.unitCost || 0) * 1.1))}
+                </b>
+              </div>
+              <div className="flex justify-between" style={{ marginTop: 4 }}>
+                <span style={{ color: t.sub }}>입고 희망일</span>
+                <span className="num">{fmtDate(addDays(TODAY, poPreview.leadTime || 0))} (리드타임 {poPreview.leadTime}일)</span>
+              </div>
+            </div>
+
+            <div style={{ fontSize: 11.5, color: t.sub, marginTop: 12, lineHeight: 1.6 }}>
+              <b style={{ color: t.ink }}>AI 분석 근거:</b> {poPreview.reason}
+            </div>
+            <div style={{ fontSize: 10.5, color: t.faint, marginTop: 10 }}>
+              본 발주서는 대시보드에서 자동 생성된 참고용 문서이며, 실제 발주 전 공급업체 정보와 금액을 반드시 확인하세요.
+            </div>
+
+            {/* 공급업체 이메일 발송 (Gmail 웹 작성창에 제목·본문 자동 입력) */}
+            <div className="no-print" style={{ marginTop: 16, borderTop: `1px solid ${t.border}`, paddingTop: 14 }}>
+              <div style={label}>공급업체 이메일로 보내기</div>
+              <div className="flex items-center gap-2" style={{ marginTop: 6 }}>
+                <input
+                  type="email"
+                  value={supplierEmail}
+                  onChange={(e) => setSupplierEmail(e.target.value)}
+                  placeholder="supplier@example.com (선택)"
+                  style={{ ...card, background: t.surfaceAlt, borderRadius: 9, padding: "9px 11px", fontSize: 13, color: t.ink, flex: 1, outline: "none" }}
+                />
+                <button onClick={() => emailPO(poPreview)}
+                  style={{ background: t.brand, color: "#fff", border: "none", borderRadius: 9, padding: "9px 14px", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
+                  📧 Gmail로 보내기
+                </button>
+              </div>
+              <div style={{ fontSize: 10.5, color: t.faint, marginTop: 6, lineHeight: 1.5 }}>
+                클릭하면 새 탭에서 Gmail 작성창이 열리며 제목·본문에 발주서 내용이 자동으로 채워집니다 (Google 계정 로그인 필요).
+                이메일 주소를 비워두면 받는 사람만 직접 입력하면 됩니다.
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 no-print" style={{ marginTop: 14 }}>
+              <button onClick={() => window.print()}
+                style={{ flex: 1, background: t.brand, color: "#fff", border: "none", borderRadius: 10, padding: "10px 14px", fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}>
+                🖨️ 인쇄 / PDF로 저장
+              </button>
+              <button onClick={() => downloadPO(poPreview)}
+                style={{ background: "transparent", color: t.sub, border: `1.5px solid ${t.border}`, borderRadius: 10, padding: "10px 14px", fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}>
+                ⬇️ 텍스트 다운로드
+              </button>
+              <button onClick={() => setPoPreview(null)}
+                style={{ background: "transparent", color: t.faint, border: "none", borderRadius: 10, padding: "10px 12px", fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}>
+                닫기
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ===== 설정 모달 ===== */}
+      {settingsOpen && (
+        <div onClick={() => setSettingsOpen(false)}
+          style={{ position: "fixed", inset: 0, background: "rgba(8,14,22,.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ ...card, width: "100%", maxWidth: 460, padding: 24 }}>
+            <div className="flex items-center justify-between mb-4">
+              <div style={{ fontWeight: 700, fontSize: 16 }}>⚙️ API 설정</div>
+              <button onClick={() => setSettingsOpen(false)} style={{ background: "none", border: "none", color: t.faint, fontSize: 18, cursor: "pointer" }}>✕</button>
+            </div>
+
+            <div style={label}>분석 모드</div>
+            <div className="flex items-center justify-between" style={{ background: t.surfaceAlt, borderRadius: 10, padding: "12px 14px", margin: "6px 0 16px" }}>
+              <div>
+                <div style={{ fontSize: 13.5, fontWeight: 700, color: t.ink }}>{demoMode ? "🧪 데모 모드" : "🔴 실서비스 모드"}</div>
+                <div style={{ fontSize: 11.5, color: t.sub, marginTop: 2 }}>
+                  {demoMode ? "API 호출 없이 예시 데이터로 체험 (비용 없음)" : "실제 Anthropic API + 웹 검색 호출 (비용 발생)"}
+                </div>
+              </div>
+              <button onClick={() => setDemoMode(!demoMode)}
+                style={{
+                  width: 46, height: 26, borderRadius: 999, border: "none", cursor: "pointer", position: "relative", flexShrink: 0,
+                  background: demoMode ? t.border : t.brand, transition: "background .15s",
+                }}>
+                <span style={{
+                  position: "absolute", top: 3, left: demoMode ? 3 : 23, width: 20, height: 20, borderRadius: 999,
+                  background: "#fff", transition: "left .15s", boxShadow: "0 1px 3px rgba(0,0,0,.3)",
+                }} />
+              </button>
+            </div>
+
+            <div style={label}>사용 모델</div>
+            <select value={model} onChange={(e) => setModel(e.target.value)} disabled={demoMode}
+              style={{ ...card, background: t.surfaceAlt, borderRadius: 10, padding: "10px 12px", fontSize: 14, color: t.ink, width: "100%", margin: "6px 0 16px", cursor: demoMode ? "not-allowed" : "pointer", opacity: demoMode ? 0.6 : 1 }}>
+              <option value="claude-sonnet-4-6">claude-sonnet-4-6 (권장 · 분석 정확도 우선)</option>
+              <option value="claude-haiku-4-5-20251001">claude-haiku-4-5 (속도 우선)</option>
+            </select>
+
+            <div style={label}>API 키 관리 방식</div>
+            <div style={{ background: t.brandSoft, color: t.brand, borderRadius: 10, padding: "10px 12px", fontSize: 12.5, lineHeight: 1.6, marginTop: 6 }}>
+              이 앱은 브라우저에서 Anthropic API를 직접 호출하지 않습니다. 요청은 항상 우리 서버의 <b>/api/forecast</b>를 거치며,
+              실제 API 키는 서버 환경변수 <b>ANTHROPIC_API_KEY</b>에만 저장되어 브라우저에는 절대 노출되지 않습니다.
+              배포 시 Vercel 프로젝트 설정의 Environment Variables에 키를 등록하세요.
+            </div>
+
+            <div style={{ ...label, marginTop: 16 }}>홈 화면에 앱으로 설치</div>
+            <div style={{ background: t.surfaceAlt, borderRadius: 10, padding: "10px 12px", fontSize: 12.5, color: t.sub, lineHeight: 1.7, marginTop: 6 }}>
+              <b style={{ color: t.ink }}>Android / Chrome:</b> 헤더의 <b>⬇️ 앱 설치</b> 버튼을 누르면 바로 설치됩니다.<br />
+              <b style={{ color: t.ink }}>iPhone / Safari:</b> 공유 버튼(⬆️) → <b>홈 화면에 추가</b>를 눌러주세요. (iOS는 자동 설치 버튼을 지원하지 않습니다)
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
